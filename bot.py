@@ -7,14 +7,20 @@ import sys
 import os
 import pymysql
 import time
+import ctypes
+import re
 from configparser import ConfigParser
-from pprint import pprint
 from threading import BoundedSemaphore
 
 tracker_thread_pool = []
 
 single_lock = threading.Lock()
 sem = BoundedSemaphore(3)
+
+
+class JabberBot(object):
+    def __init__(self):
+        pass
 
 
 def config_section_map():
@@ -119,6 +125,13 @@ class Bot(threading.Thread):
                              'VALUES ("%s", %s, %s);' % (entry, int(time.time()), self.tracker_id))
             self.conn.commit()
 
+    @staticmethod
+    def _check_free_space(torrent_size):
+        free_bytes = ctypes.c_ulonglong(0)
+        ctypes.windll.kernel32.GetDiskFreeSpaceExW(ctypes.c_wchar_p(u'c:\\'), None, None, ctypes.pointer(free_bytes))
+        free_gb = int(round(free_bytes.value, 2)) / 1024 / 1024 / 1024
+        return True if free_gb > float(torrent_size) else False
+
     def run(self):
         print("Starting main Thread")
         while self.stop is not True:
@@ -128,10 +141,12 @@ class Bot(threading.Thread):
                 feed = feedparser.parse(self.rss_link)
                 for f in feed.entries:
                     if f.link not in entries:
-                        print("Adding:")
-                        pprint(f)
-                        self.download_link(f.link)
-                        self._update_list(f.link)
+                        print("Adding:\n {link}".format(link=f.link))
+                        m = re.match('.*Size: (\d+.\d+) GB.*', f.summary.split("\n")[1])
+                        size = m.group(1)
+                        if self._check_free_space(size) is True:
+                            self.download_link(f.link)
+                            self._update_list(f.link)
                 time.sleep(2)
             except ComplexException as e:
                 print(e)
