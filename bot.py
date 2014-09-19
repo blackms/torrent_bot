@@ -115,7 +115,7 @@ class StatsScheduler(threading.Thread):
                 msg = self.ut.get_stats(time_frame='1d')
                 print("[thread.StatsScheduler.run] Pushing message in queue.")
                 msg_queue.put(msg)
-                for _ in range(1800):
+                for _ in range(3600):
                     time.sleep(1)
                     if self.stop is True:
                         break
@@ -164,34 +164,16 @@ class SenderThread(threading.Thread):
             print("[thread.SenderThread] has gone away.")
 
 
-class TorrentRemover(object):
-    def __init__(self, host, username, password):
-        self._conn = Connection(host, username, password).utorrent(api='falcon')
-
-    @run_in_thread
-    def remove(self):
-        sort_field = 'ratio'
-        t_list = sorted(self._conn.torrent_list().items(), key=lambda x: getattr(x[1], sort_field), reverse=True)
-        min_age = time.time() - 259200
-        for _t in t_list:
-            t_hash, t_data = _t[0], _t[1]
-            if t_data.ratio < 3 or t_data.ul_speed > 0 or t_data.dl_speed > 0:
-                continue
-            if time.mktime(t_data.completed_on.timetuple()) < min_age:
-                continue
-            print(t_data.name)
-            self._conn.torrent_stop(t_hash)
-            self._conn.torrent_remove(t_hash, with_data=True)
-            removed_q.put(t_data)
-
-
 class UtorrentMgmt(object):
     def __init__(self, host, username, password):
         self._conn = Connection(host, username, password).utorrent(api='falcon')
 
     def get_stats(self, time_frame='1d'):
         res = self._conn.xfer_history_get()
-        excl_local = self._conn.settings_get()["net.limit_excludeslocal"]
+        try:
+            excl_local = self._conn.settings_get()["net.limit_excludeslocal"]
+        except self._conn.uTorrentError:
+            return "Failed to fetch Statistics."
         torrents = self._conn.torrent_list()
         today_start = datetime.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
         period = len(res["daily_download"])
@@ -235,6 +217,35 @@ class UtorrentMgmt(object):
             stat_msg += level1 + "Added torrents: {}\n".format(len(today_added_torrents))
             stat_msg += level1 + "Completed torrents: {}\n".format(len(today_completed_torrents))
         return stat_msg
+
+    @run_in_thread
+    def remove(self):
+
+        def older_than_min(t_data):
+            min_age = time.time() - 259200
+            return True if time.mktime(t_data.completed_on.timetuple()) < min_age else False
+
+        sort_field = 'ratio'
+        t_list = sorted(self._conn.torrent_list().items(), key=lambda x: getattr(x[1], sort_field), reverse=True)
+        t_score = []
+        for _t in t_list:
+            torrent_score = {'name': _t[1].name, 'data': _t[1], 'hash': _t[0], 'score': 100}
+            if torrent_score['data'].label.lower() == 'no_delete':
+                torrent_score['score'] -= 100
+                continue
+            elif torrent_score['data'].ratio < 3:
+                torrent_score['score'] -= 80
+            elif torrent_score['data'].ratio < 3 and older_than_min(torrent_score['data']):
+                torrent_score['score'] -= 40
+            elif torrent_score['data'].ul_speed > 0:
+                torrent_score['score'] -= 20
+            elif older_than_min(torrent_score['data']):
+                torrent_score['score'] -= 10
+            t_score.append(torrent_score)
+        to_delete = sorted(t_score, key=lambda k: k['score'], reverse=True)
+        self._conn.torrent_stop(to_delete[0]['hash'])
+        self._conn.torrent_remove(to_delete[0]['hash'], with_data=True)
+        removed_q.put(to_delete[0]['data'])
 
 
 class GarbageCollector(threading.Thread):
@@ -330,9 +341,9 @@ class Bot(threading.Thread):
                                                                               size=size))
                         while self._get_free_space() < float(size):
                             print("[thread.Bot.run] No space available to add new torrents. Spawning Remover...")
-                            tr = TorrentRemover(config['torrent_webui']['webui_host'],
-                                                config['torrent_webui']['webui_username'],
-                                                config['torrent_webui']['webui_password'])
+                            tr = UtorrentMgmt(config['torrent_webui']['webui_host'],
+                                              config['torrent_webui']['webui_username'],
+                                              config['torrent_webui']['webui_password'])
                             t_thread = tr.remove()
                             t_thread.join()
                             t_data = removed_q.get(block=True)
